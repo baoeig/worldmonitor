@@ -1,24 +1,11 @@
 
 import { Panel } from './Panel';
 import { t } from '@/services/i18n';
-import { getLocalApiPort, isDesktopRuntime } from '@/services/runtime';
-import {
-  getDesktopReadinessChecks,
-  getKeyBackedAvailabilitySummary,
-  getNonParityFeatures,
-} from '@/services/desktop-readiness';
 import {
   fetchServiceStatuses,
   type ServiceStatusResult as ServiceStatus,
 } from '@/services/infrastructure';
-import { h, replaceChildren, type DomChild } from '@/utils/dom-utils';
-
-interface LocalBackendStatus {
-  enabled?: boolean;
-  mode?: string;
-  port?: number;
-  remoteBase?: string;
-}
+import { h, replaceChildren } from '@/utils/dom-utils';
 
 type CategoryFilter = 'all' | 'cloud' | 'dev' | 'comm' | 'ai' | 'saas';
 
@@ -39,20 +26,24 @@ export class ServiceStatusPanel extends Panel {
   private loading = true;
   private error: string | null = null;
   private filter: CategoryFilter = 'all';
-  private localBackend: LocalBackendStatus | null = null;
-
   constructor() {
-    super({ id: 'service-status', title: t('panels.serviceStatus'), showCount: false });
-    void this.fetchStatus();
+    super({ id: 'service-status', title: t('panels.serviceStatus'), showCount: false, infoTooltip: t('components.serviceStatus.infoTooltip') });
   }
 
   private lastServicesJson = '';
 
   public async fetchStatus(): Promise<boolean> {
+    let keptLastGood = false;
     try {
       const data = await fetchServiceStatuses();
       if (!this.element?.isConnected) return false;
-      if (!data.success) throw new Error('Failed to load status');
+      if (!data.success || data.services.length === 0) {
+        if (this.services.length > 0) {
+          keptLastGood = true;
+          return false;
+        }
+        throw new Error('Failed to load status');
+      }
 
       const fingerprint = data.services.map(s => `${s.name}:${s.status}`).join(',');
       const changed = fingerprint !== this.lastServicesJson;
@@ -68,7 +59,7 @@ export class ServiceStatusPanel extends Panel {
       return true;
     } finally {
       this.loading = false;
-      if (this.element?.isConnected) {
+      if (this.element?.isConnected && !keptLastGood) {
         this.render();
       }
     }
@@ -100,37 +91,17 @@ export class ServiceStatusPanel extends Panel {
       return;
     }
 
-    this.setErrorState(false);
     const filtered = this.getFilteredServices();
     const issues = filtered.filter(s => s.status !== 'operational');
 
-    replaceChildren(this.content,
-      this.buildBackendStatus(),
-      this.buildDesktopReadiness(),
+    this.setContentNodes(
       this.buildSummary(filtered),
       this.buildFilters(),
       h('div', { className: 'service-status-list' },
         ...this.buildServiceItems(filtered),
       ),
-      issues.length === 0 ? h('div', { className: 'all-operational' }, t('components.serviceStatus.allOperational')) : false,
-    );
-  }
-
-  private buildBackendStatus(): DomChild {
-    if (!isDesktopRuntime()) return false;
-
-    if (!this.localBackend?.enabled) {
-      return h('div', { className: 'service-status-backend warning' },
-        t('components.serviceStatus.backendUnavailable'),
-      );
-    }
-
-    const port = this.localBackend.port ?? getLocalApiPort();
-    const remote = this.localBackend.remoteBase ?? 'https://worldmonitor.app';
-
-    return h('div', { className: 'service-status-backend' },
-      'Local backend active on ', h('strong', null, `127.0.0.1:${port}`),
-      ' · cloud fallback: ', h('strong', null, remote),
+      filtered.length === 0 ? h('div', { className: 'panel-empty' }, t('common.noDataAvailable')) : false,
+      filtered.length > 0 && issues.length === 0 ? h('div', { className: 'all-operational' }, t('components.serviceStatus.allOperational')) : false,
     );
   }
 
@@ -155,33 +126,6 @@ export class ServiceStatusPanel extends Panel {
     );
   }
 
-  private buildDesktopReadiness(): DomChild {
-    if (!isDesktopRuntime()) return false;
-
-    const checks = getDesktopReadinessChecks(Boolean(this.localBackend?.enabled));
-    const keySummary = getKeyBackedAvailabilitySummary();
-    const nonParity = getNonParityFeatures();
-
-    return h('div', { className: 'service-status-desktop-readiness' },
-      h('div', { className: 'service-status-desktop-title' }, t('components.serviceStatus.desktopReadiness')),
-      h('div', { className: 'service-status-desktop-subtitle' },
-        t('components.serviceStatus.acceptanceChecks', { ready: String(checks.filter(check => check.ready).length), total: String(checks.length), available: String(keySummary.available), featureTotal: String(keySummary.total) }),
-      ),
-      h('ul', { className: 'service-status-desktop-list' },
-        ...checks.map(check =>
-          h('li', null, `${check.ready ? '✅' : '⚠️'} ${check.label}`),
-        ),
-      ),
-      h('details', { className: 'service-status-non-parity' },
-        h('summary', null, t('components.serviceStatus.nonParityFallbacks', { count: String(nonParity.length) })),
-        h('ul', null,
-          ...nonParity.map(feature =>
-            h('li', null, h('strong', null, feature.panel), `: ${feature.fallback}`),
-          ),
-        ),
-      ),
-    );
-  }
 
   private buildFilters(): HTMLElement {
     const categories: CategoryFilter[] = ['all', 'cloud', 'dev', 'comm', 'ai', 'saas'];

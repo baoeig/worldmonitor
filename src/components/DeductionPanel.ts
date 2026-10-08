@@ -1,24 +1,34 @@
 import { Panel } from './Panel';
-import { IntelligenceServiceClient } from '@/generated/client/worldmonitor/intelligence/v1/service_client';
-import { h, replaceChildren } from '@/utils/dom-utils';
+import { createLazyClient, getRpcBaseUrl } from '@/services/rpc-client';
+import { premiumFetch } from '@/services/premium-fetch';
+import { h, replaceChildren, setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+import { yieldToMain } from '@/utils/after-paint';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import type { NewsItem, DeductContextDetail } from '@/types';
 import { buildNewsContext } from '@/utils/news-context';
+import { getActiveFrameworkForPanel } from '@/services/analysis-framework-store';
+import { hasPremiumAccess } from '@/services/panel-gating';
+import { FrameworkSelector } from './FrameworkSelector';
+import { extractDeductionProbability } from './deduction-probability';
+import { IntelligenceServiceClient } from '@/services/generated-rpc-clients';
 
-const client = new IntelligenceServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
+// deduct-situation + list-market-implications are premium-gated.
+const getIntelligenceClient = createLazyClient(() => new IntelligenceServiceClient(getRpcBaseUrl(), { fetch: premiumFetch }));
 
 const COOLDOWN_MS = 5_000;
 
 export class DeductionPanel extends Panel {
     private formEl: HTMLFormElement;
     private inputEl: HTMLTextAreaElement;
-    private geoInputEl: HTMLInputElement;
+    private geoInputEl: HTMLTextAreaElement;
     private resultContainer: HTMLElement;
+    private contentRoot: HTMLElement;
     private submitBtn: HTMLButtonElement;
     private isSubmitting = false;
     private getLatestNews?: () => NewsItem[];
     private contextHandler: EventListener;
+    private fwSelector: FrameworkSelector;
 
     constructor(getLatestNews?: () => NewsItem[]) {
         super({
@@ -36,21 +46,25 @@ export class DeductionPanel extends Panel {
             rows: 3,
         }) as HTMLTextAreaElement;
 
-        this.geoInputEl = h('input', {
+        this.geoInputEl = h('textarea', {
             className: 'deduction-geo-input',
-            type: 'text',
-            placeholder: 'Optional geographic or situation context...',
-        }) as HTMLInputElement;
+            rows: 2,
+            placeholder: 'Geographic or situation context (optional)...',
+        }) as HTMLTextAreaElement;
 
         this.submitBtn = h('button', {
             className: 'deduction-submit-btn',
             type: 'submit',
         }, 'Analyze') as HTMLButtonElement;
 
+        const formRow = h('div', { className: 'deduction-form-row' },
+            this.geoInputEl,
+            this.submitBtn,
+        );
+
         this.formEl = h('form', { className: 'deduction-form' },
             this.inputEl,
-            this.geoInputEl,
-            this.submitBtn
+            formRow,
         ) as HTMLFormElement;
 
         this.formEl.addEventListener('submit', this.handleSubmit.bind(this));
@@ -61,6 +75,7 @@ export class DeductionPanel extends Panel {
             this.formEl,
             this.resultContainer
         );
+        this.contentRoot = container;
 
         replaceChildren(this.content, container);
 
@@ -88,11 +103,149 @@ export class DeductionPanel extends Panel {
             }
         }) as EventListener;
         document.addEventListener('wm:deduct-context', this.contextHandler);
+
+        this.fwSelector = new FrameworkSelector({ panelId: 'deduction', isPremium: hasPremiumAccess(), panel: this });
+        this.header.appendChild(this.fwSelector.el);
+    }
+
+    private deductionGeneration = 0;
+    private deductionAbort: AbortController | null = null;
+
+    public override clearSensitiveContent(): void {
+        this.deductionGeneration += 1;
+        // The previous account's request must not keep running (and spending
+        // its quota) after the reset; discarding its result is not enough.
+        this.deductionAbort?.abort();
+        this.deductionAbort = null;
+        this.inputEl.value = '';
+        this.geoInputEl.value = '';
+        this.resultContainer.replaceChildren();
+        this.resultContainer.className = 'deduction-result';
+        this.isSubmitting = false;
+        this.submitBtn.disabled = false;
+        super.clearSensitiveContent();
+    }
+
+    public override unlockPanel(): void {
+        super.unlockPanel();
+        if (!this.content.contains(this.contentRoot)) {
+            this.resultContainer.replaceChildren();
+            this.setContentNodes(this.contentRoot);
+        }
     }
 
     public override destroy(): void {
         document.removeEventListener('wm:deduct-context', this.contextHandler);
+        this.fwSelector.destroy();
         super.destroy();
+    }
+
+    /** Post-process parsed markdown HTML into visually structured sections. */
+    private reformatResult(container: HTMLElement): void {
+        const SECTIONS = [
+            { re: /^bottom\s+line/i,       cls: 'ds-verdict',   label: 'Bottom Line' },
+            { re: /^what\s+we\s+know/i,    cls: 'ds-evidence',  label: 'What We Know' },
+            { re: /^most\s+likely\s+path/i, cls: 'ds-primary',  label: 'Most Likely Path' },
+            { re: /^alternative\s+path/i,  cls: 'ds-alt',       label: 'Alternative Paths' },
+            { re: /^confidence/i,          cls: 'ds-confidence', label: 'Confidence' },
+        ] as const;
+
+        // Collect top-level children; group by section boundary
+        const nodes = Array.from(container.childNodes) as HTMLElement[];
+        const groups: { cls: string; label: string; nodes: HTMLElement[] }[] = [];
+        let current: { cls: string; label: string; nodes: HTMLElement[] } | null = null;
+
+        for (const node of nodes) {
+            const strongText = (node.querySelector?.('strong')?.textContent ?? node.textContent ?? '').trim();
+            const match = SECTIONS.find(s => s.re.test(strongText));
+            if (match) {
+                current = { cls: match.cls, label: match.label, nodes: [] };
+                groups.push(current);
+            }
+            if (current) current.nodes.push(node);
+            else if (!match) groups.push({ cls: '', label: '', nodes: [node] }); // unsectioned
+        }
+
+        if (groups.every(g => !g.cls)) return; // nothing to restructure
+
+        container.replaceChildren();
+        for (const group of groups) {
+            if (!group.cls) {
+                group.nodes.forEach(n => container.appendChild(n));
+                continue;
+            }
+
+            const section = document.createElement('div');
+            section.className = group.cls;
+
+            // Inject section label (remove the <strong> header from content)
+            const labelEl = document.createElement('div');
+            labelEl.className = 'ds-section-label';
+
+            // For primary path, extract probability from heading text
+            if (group.cls === 'ds-primary') {
+                const headingNode = group.nodes[0];
+                const fullText = headingNode?.textContent ?? '';
+                const probability = extractDeductionProbability(fullText);
+                const timeMatch = /\(([^)]+)\)/.exec(fullText);
+                labelEl.textContent = group.label;
+                if (timeMatch) {
+                    const timeSpan = document.createElement('span');
+                    timeSpan.style.cssText = 'font-size:calc(10px * var(--wm-panel-effective-scale, 1));color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0';
+                    timeSpan.textContent = timeMatch[1] ?? '';
+                    labelEl.appendChild(timeSpan);
+                }
+                if (probability) {
+                    const badge = document.createElement('span');
+                    badge.className = 'ds-prob-badge';
+                    badge.textContent = probability.label;
+                    badge.title = probability.isRange ? 'Rough probability range from the source' : 'Approximate probability from the source';
+                    labelEl.appendChild(badge);
+                }
+            } else {
+                labelEl.textContent = group.label;
+            }
+            section.appendChild(labelEl);
+
+            // Add body nodes (skip first node which was the header paragraph)
+            const bodyNodes = group.nodes.slice(1);
+            if (bodyNodes.length === 0 && group.nodes[0]) {
+                // Inline header: strip the strong header, keep the rest as body
+                const clone = group.nodes[0].cloneNode(true) as HTMLElement;
+                clone.querySelector('strong')?.remove();
+                const bodyDiv = document.createElement('div');
+                bodyDiv.className = group.cls === 'ds-primary' ? 'ds-primary-body' : '';
+                setTrustedHtml(
+                    bodyDiv,
+                    trustedHtml(clone.innerHTML.replace(/^[\s:–—-]+/, ''), 'legacy direct innerHTML migration'),
+                );
+                section.appendChild(bodyDiv);
+            } else {
+                // For alt paths: inject probability badges into li items
+                if (group.cls === 'ds-alt') {
+                    bodyNodes.forEach(n => {
+                        if (n.tagName === 'UL') {
+                            n.querySelectorAll('li').forEach(li => {
+                                const probability = extractDeductionProbability(li.textContent ?? '', { leadingOnly: true });
+                                if (probability) {
+                                    const badge = document.createElement('span');
+                                    badge.className = 'ds-alt-prob';
+                                    badge.textContent = probability.label;
+                                    badge.title = probability.isRange ? 'Rough probability range from the source' : 'Approximate probability from the source';
+                                    li.textContent = probability.remainder;
+                                    li.insertBefore(badge, li.firstChild);
+                                }
+                            });
+                        }
+                        section.appendChild(n);
+                    });
+                } else {
+                    bodyNodes.forEach(n => section.appendChild(n));
+                }
+            }
+
+            container.appendChild(section);
+        }
     }
 
     private async handleSubmit(e: Event) {
@@ -111,41 +264,61 @@ export class DeductionPanel extends Panel {
             }
         }
 
+        const fw = getActiveFrameworkForPanel('deduction');
+
+        const generation = ++this.deductionGeneration;
+        this.deductionAbort?.abort();
+        const controller = new AbortController();
+        this.deductionAbort = controller;
         this.isSubmitting = true;
         this.submitBtn.disabled = true;
 
         this.resultContainer.className = 'deduction-result loading';
-        this.resultContainer.textContent = 'Analyzing timeline and impact...';
+        setTrustedHtml(
+            this.resultContainer,
+            trustedHtml(
+                '<div class="deduction-loading-dots"><span></span><span></span><span></span></div>Analyzing…',
+                'legacy direct innerHTML migration',
+            ),
+        );
 
         try {
-            const resp = await client.deductSituation({
+            const resp = await getIntelligenceClient().deductSituation({
                 query,
                 geoContext,
-            });
-            if (!this.element?.isConnected) return;
+                framework: fw?.systemPromptAppend ?? '',
+            }, { signal: controller.signal });
+            if (generation !== this.deductionGeneration || !this.element?.isConnected) return;
 
             this.resultContainer.className = 'deduction-result';
             if (resp.analysis) {
                 const parsed = await marked.parse(resp.analysis);
-                if (!this.element?.isConnected) return;
-                this.resultContainer.innerHTML = DOMPurify.sanitize(parsed);
-
-                const meta = h('div', { style: 'margin-top: 12px; font-size: 0.75em; color: #888;' },
-                    `Generated by ${resp.provider || 'AI'}${resp.model ? ` (${resp.model})` : ''}`
-                );
-                this.resultContainer.appendChild(meta);
+                if (generation !== this.deductionGeneration || !this.element?.isConnected) return;
+                // Yield so the response paint lands before the synchronous DOMPurify
+                // pass (the heavy `sanitize` chunk) — breaks the post-response long
+                // task instead of running parse+purify+innerHTML as one block (#4537).
+                await yieldToMain();
+                if (generation !== this.deductionGeneration || !this.element?.isConnected) return;
+                const safe = DOMPurify.sanitize(parsed);
+                setTrustedHtml(this.resultContainer, trustedHtml(safe, 'legacy direct innerHTML migration'));
+                this.reformatResult(this.resultContainer);
             } else {
-                this.resultContainer.textContent = 'No analysis available for this query.';
+                this.resultContainer.textContent = resp.provider === 'error'
+                    ? 'AI analysis temporarily unavailable. Please try again in a moment.'
+                    : 'No analysis available for this query.';
             }
         } catch (err) {
-            if (!this.element?.isConnected) return;
+            if (generation !== this.deductionGeneration || !this.element?.isConnected) return;
             console.error('[DeductionPanel] Error:', err);
             this.resultContainer.className = 'deduction-result error';
             this.resultContainer.textContent = 'An error occurred while analyzing the situation.';
         } finally {
-            this.isSubmitting = false;
-            if (this.element?.isConnected) {
-                setTimeout(() => { this.submitBtn.disabled = false; }, COOLDOWN_MS);
+            if (this.deductionAbort === controller) this.deductionAbort = null;
+            if (generation === this.deductionGeneration) {
+                this.isSubmitting = false;
+                if (this.element?.isConnected) {
+                    setTimeout(() => { this.submitBtn.disabled = false; }, COOLDOWN_MS);
+                }
             }
         }
     }

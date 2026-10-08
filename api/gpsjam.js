@@ -1,4 +1,6 @@
-import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
+import { getCorsHeaders, getPublicCorsHeaders, isDisallowedOrigin } from './_cors.js';
+import { jsonResponse } from './_json-response.js';
+import { readJsonFromUpstash } from './_upstash-json.js';
 
 export const config = { runtime: 'edge' };
 
@@ -12,21 +14,28 @@ const CACHE_TTL = 300_000;
 let negUntil = 0;
 const NEG_TTL = 60_000;
 
-async function readFromRedis(key) {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) return null;
-
-  const resp = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(3_000),
-  });
-  if (!resp.ok) return null;
-
-  const data = await resp.json();
-  if (!data.result) return null;
-
-  try { return JSON.parse(data.result); } catch { return null; }
+// Normalize any stored hex to the web-UI shape the map reads (pct + affected/total
+// aircraft), regardless of which schema produced it: new gpsjam.org v2 (pct),
+// legacy Wingbits v2 (npAvg, still lingering under its 48h TTL right after the
+// 2026-07 source switch), or the v1 dual-write (pct/good/bad/total).
+export function toWebHex(hex) {
+  const base = { h3: hex.h3, lat: hex.lat, lon: hex.lon, level: hex.level, region: hex.region };
+  if (Number.isFinite(hex.pct)) {
+    return {
+      ...base,
+      pct: hex.pct,
+      affectedAircraft: hex.affectedAircraft ?? hex.bad ?? hex.sampleCount ?? 0,
+      totalAircraft: hex.totalAircraft ?? hex.total ?? hex.aircraftCount ?? 0,
+    };
+  }
+  // Legacy Wingbits v2 (npAvg, no pct): derive a coarse pct from the level buckets.
+  const npAvg = Number.isFinite(hex.npAvg) ? hex.npAvg : 2;
+  return {
+    ...base,
+    pct: npAvg <= 0.5 ? 15 : npAvg <= 1.0 ? 5 : 0,
+    affectedAircraft: hex.sampleCount ?? 0,
+    totalAircraft: hex.aircraftCount ?? 0,
+  };
 }
 
 async function fetchGpsJamData() {
@@ -34,39 +43,20 @@ async function fetchGpsJamData() {
   if (cached && now - cachedAt < CACHE_TTL) return cached;
   if (now < negUntil) return null;
 
-  let data;
-  try { data = await readFromRedis(REDIS_KEY); } catch { data = null; }
-
-  if (!data) {
-    let v1;
-    try { v1 = await readFromRedis(REDIS_KEY_V1); } catch { v1 = null; }
-    if (v1?.hexes) {
-      data = {
-        ...v1,
-        source: v1.source || 'gpsjam.org (normalized)',
-        hexes: v1.hexes.map(hex => {
-          if ('npAvg' in hex) return hex;
-          const pct = hex.pct || 0;
-          return {
-            h3: hex.h3,
-            lat: hex.lat,
-            lon: hex.lon,
-            level: hex.level,
-            region: hex.region,
-            npAvg: pct > 10 ? 0.3 : pct >= 2 ? 0.8 : 1.5,
-            sampleCount: hex.bad || 0,
-            aircraftCount: hex.total || 0,
-          };
-        }),
-      };
-    }
+  let raw;
+  // Seeder-owned keys (#7674): scripts/fetch-gpsjam.mjs publishes these bare —
+  // read them raw in every environment so preview sees the fleet rows.
+  try { raw = await readJsonFromUpstash(REDIS_KEY, 3_000, true); } catch { raw = null; }
+  if (!raw) {
+    try { raw = await readJsonFromUpstash(REDIS_KEY_V1, 3_000, true); } catch { raw = null; }
   }
 
-  if (!data) {
+  if (!raw?.hexes) {
     negUntil = now + NEG_TTL;
     return null;
   }
 
+  const data = { ...raw, source: raw.source || 'gpsjam.org', hexes: raw.hexes.map(toWebHex) };
   cached = data;
   cachedAt = now;
   return data;
@@ -80,31 +70,27 @@ export default async function handler(req) {
   }
 
   if (isDisallowedOrigin(req)) {
-    return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
-      status: 403,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders },
-    });
+    return jsonResponse({ error: 'Origin not allowed' }, 403, corsHeaders);
   }
+
+  const publicCorsHeaders = getPublicCorsHeaders('GET, OPTIONS');
 
   const data = await fetchGpsJamData();
 
   if (!data) {
-    return new Response(JSON.stringify({ error: 'GPS interference data temporarily unavailable' }), {
-      status: 503,
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache, no-store',
-        ...corsHeaders,
-      },
-    });
+    return jsonResponse(
+      { error: 'GPS interference data temporarily unavailable' },
+      503,
+      { 'Cache-Control': 'no-cache, no-store', ...corsHeaders },
+    );
   }
 
-  return new Response(JSON.stringify(data), {
-    status: 200,
-    headers: {
-      'Content-Type': 'application/json',
+  return jsonResponse(
+    data,
+    200,
+    {
       'Cache-Control': 's-maxage=3600, stale-while-revalidate=1800, stale-if-error=3600',
-      ...corsHeaders,
+      ...publicCorsHeaders,
     },
-  });
+  );
 }

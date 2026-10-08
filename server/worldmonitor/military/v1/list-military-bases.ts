@@ -6,20 +6,24 @@ import type {
   MilitaryBaseCluster,
 } from '../../../../src/generated/server/worldmonitor/military/v1/service_server';
 
+import filterParamContracts from '../../../../shared/openapi-filter-param-contracts.json';
 import { cachedFetchJson, getCachedJson, geoSearchByBox, getHashFieldsBatch } from '../../../_shared/redis';
 import { markNoCacheResponse, setResponseHeader } from '../../../_shared/response-headers';
 
-const VALID_TYPES = new Set([
-  'us-nato', 'china', 'russia', 'uk', 'france', 'india', 'italy', 'uae', 'turkey', 'japan', 'other',
-]);
-const VALID_KINDS = new Set([
-  'base', 'airfield', 'naval_base', 'military', 'barracks', 'bunker', 'trench',
-  'training_area', 'checkpoint', 'shelter', 'ammunition', 'office', 'obstacle_course',
-  'nuclear_explosion_site', 'range',
-]);
+const VALID_TYPES = new Set(filterParamContracts.militaryBaseTypes);
+const VALID_KINDS = new Set(filterParamContracts.militaryBaseKinds);
 const COUNTRY_RE = /^[A-Z]{2}$/;
 
-const quantize = (v: number, step: number) => Math.round(v / step) * step;
+const quantize = (v: number, step: number, upper = false) => (upper ? Math.ceil(v / step) : Math.floor(v / step)) * step;
+const MAX_FILTER_LENGTH = 20;
+
+function normalizeOptionalFilter(
+  value: string | undefined,
+  transform: (input: string) => string,
+): string {
+  if (!value) return '';
+  return transform(value).trim().slice(0, MAX_FILTER_LENGTH);
+}
 
 function getBboxGridStep(zoom: number): number {
   if (zoom < 5) return 5;
@@ -113,15 +117,16 @@ export async function listMilitaryBases(
 
     if (!req.neLat && !req.neLon && !req.swLat && !req.swLon) return empty;
 
-    const swLat = Math.max(-90, Math.min(90, req.swLat));
-    const neLat = Math.max(-90, Math.min(90, req.neLat));
-    const swLon = Math.max(-180, Math.min(180, req.swLon));
-    const neLon = Math.max(-180, Math.min(180, req.neLon));
     const zoom = Math.max(0, Math.min(22, req.zoom || 3));
+    const gridStep = getBboxGridStep(zoom);
+    const swLat = quantize(Math.max(-90, Math.min(90, req.swLat)), gridStep);
+    const neLat = quantize(Math.max(-90, Math.min(90, req.neLat)), gridStep, true);
+    const swLon = quantize(Math.max(-180, Math.min(180, req.swLon)), gridStep);
+    const neLon = quantize(Math.max(-180, Math.min(180, req.neLon)), gridStep, true);
 
-    const typeFilter = req.type ? req.type.toLowerCase().trim().slice(0, 20) : '';
-    const kindFilter = req.kind ? req.kind.toLowerCase().trim().slice(0, 20) : '';
-    const countryFilter = req.country ? req.country.toUpperCase().trim().slice(0, 20) : '';
+    const typeFilter = normalizeOptionalFilter(req.type, v => v.toLowerCase());
+    const kindFilter = normalizeOptionalFilter(req.kind, v => v.toLowerCase());
+    const countryFilter = normalizeOptionalFilter(req.country, v => v.toUpperCase());
 
     if (typeFilter && !VALID_TYPES.has(typeFilter)) return empty;
     if (kindFilter && !VALID_KINDS.has(kindFilter)) return empty;
@@ -144,12 +149,8 @@ export async function listMilitaryBases(
     const geoKey = `military:bases:geo:${v}`;
     const metaKey = `military:bases:meta:${v}`;
 
-    const gridStep = getBboxGridStep(zoom);
-    const qBB = [
-      quantize(swLat, gridStep), quantize(swLon, gridStep),
-      quantize(neLat, gridStep), quantize(neLon, gridStep),
-    ].join(':');
-    const cacheKey = `military:bases:v1:${qBB}:${zoom}:${typeFilter}:${kindFilter}:${countryFilter}:${v}`;
+    const qBB = [swLat, swLon, neLat, neLon].join(':');
+    const cacheKey = `military:bases:v2:${qBB}:${zoom}:${typeFilter}:${kindFilter}:${countryFilter}:${v}`;
 
     const result = await cachedFetchJson<ListMilitaryBasesResponse>(
       cacheKey, 3600,
